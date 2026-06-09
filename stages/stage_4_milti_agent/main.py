@@ -4,13 +4,14 @@ Multiple specialised agents collaborate on a complex legal question.
 This mirrors Stage 5's architecture (law_agent/graph.py) but runs
 entirely in-process — no HTTP, no A2A protocol, no separate servers.
 
-Graph: analyze_law -> check_routing -> parallel [call_tax, call_compliance] -> aggregate -> END
+Graph: analyze_law -> check_routing -> parallel [call_tax, call_compliance, call_privacy] -> aggregate -> END
 """
 
 import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -94,6 +95,41 @@ def search_compliance_law(query: str) -> str:
     return "\n\n".join(results) if results else "No specific compliance matches found."
 
 
+@tool
+def search_privacy_law(query: str) -> str:
+    """Search privacy and data protection knowledge base for relevant rules.
+
+    Args:
+        query: Natural language query about privacy, GDPR, CCPA, or data protection.
+    """
+    knowledge = [
+        (
+            ["data", "privacy", "gdpr", "consent", "personal", "dữ liệu"],
+            "GDPR requires a lawful basis for processing personal data, transparency notices, "
+            "data minimisation, and strong safeguards. Serious violations can trigger fines up "
+            "to EUR 20M or 4% of annual global turnover, whichever is higher.",
+        ),
+        (
+            ["breach", "leak", "rò rỉ", "incident", "notification"],
+            "GDPR data breach rules generally require notification to the supervisory authority "
+            "within 72 hours when a breach risks individual rights and freedoms. Affected "
+            "individuals must also be notified when the risk is high.",
+        ),
+        (
+            ["ccpa", "cpra", "california", "consumer"],
+            "CCPA/CPRA gives California consumers rights to know, delete, correct, opt out of "
+            "sale/sharing, and limit sensitive personal information use. Intentional violations "
+            "can carry civil penalties up to $7,500 per violation.",
+        ),
+    ]
+    query_lower = query.lower()
+    results = []
+    for keywords, text in knowledge:
+        if any(kw in query_lower for kw in keywords):
+            results.append(text)
+    return "\n\n".join(results) if results else "No specific privacy law matches found."
+
+
 # ---------------------------------------------------------------------------
 # State definition (mirrors law_agent/graph.py)
 # ---------------------------------------------------------------------------
@@ -114,8 +150,10 @@ class LegalState(TypedDict):
     law_analysis: str
     needs_tax: bool
     needs_compliance: bool
+    needs_privacy: bool
     tax_result: Annotated[str, _last_wins]
     compliance_result: Annotated[str, _last_wins]
+    privacy_result: Annotated[str, _last_wins]
     final_answer: str
 
 
@@ -174,8 +212,20 @@ async def check_routing(state: LegalState) -> dict:
 
     needs_tax = bool(parsed.get("needs_tax", True))
     needs_compliance = bool(parsed.get("needs_compliance", True))
-    print(f"  [Node: check_routing] needs_tax={needs_tax}, needs_compliance={needs_compliance}")
-    return {"needs_tax": needs_tax, "needs_compliance": needs_compliance}
+    question_lower = state["question"].lower()
+    needs_privacy = any(
+        kw in question_lower
+        for kw in ["data", "privacy", "gdpr", "dữ liệu", "personal information", "ccpa", "breach"]
+    )
+    print(
+        "  [Node: check_routing] "
+        f"needs_tax={needs_tax}, needs_compliance={needs_compliance}, needs_privacy={needs_privacy}"
+    )
+    return {
+        "needs_tax": needs_tax,
+        "needs_compliance": needs_compliance,
+        "needs_privacy": needs_privacy,
+    }
 
 
 def route_to_specialists(state: LegalState) -> list[Send]:
@@ -185,6 +235,8 @@ def route_to_specialists(state: LegalState) -> list[Send]:
         sends.append(Send("call_tax_specialist", state))
     if state.get("needs_compliance"):
         sends.append(Send("call_compliance_specialist", state))
+    if state.get("needs_privacy"):
+        sends.append(Send("call_privacy_specialist", state))
     if not sends:
         sends.append(Send("aggregate", state))
     return sends
@@ -235,6 +287,27 @@ async def call_compliance_specialist(state: LegalState) -> dict:
     return {"compliance_result": final_msg}
 
 
+async def call_privacy_specialist(state: LegalState) -> dict:
+    """Privacy specialist sub-agent (runs as inline ReAct agent)."""
+    from langgraph.prebuilt import create_react_agent
+
+    print("\n  [Node: call_privacy_specialist] Privacy specialist agent starting...")
+
+    privacy_prompt = (
+        "You are a senior privacy counsel specialising in GDPR, CCPA/CPRA, data protection, "
+        "breach notification, consent, lawful basis, data subject rights, and privacy governance. "
+        "Use the search_privacy_law tool to ground your analysis. Keep your response under 200 words."
+    )
+
+    llm = get_llm()
+    agent = create_react_agent(model=llm, tools=[search_privacy_law], prompt=privacy_prompt)
+    result = await agent.ainvoke({"messages": [{"role": "user", "content": state["question"]}]})
+
+    final_msg = result["messages"][-1].content
+    print(f"  [Node: call_privacy_specialist] Done ({len(final_msg)} chars)")
+    return {"privacy_result": final_msg}
+
+
 async def aggregate(state: LegalState) -> dict:
     """Combine all specialist analyses into a final comprehensive answer."""
     print("\n  [Node: aggregate] Combining all specialist analyses...")
@@ -247,6 +320,8 @@ async def aggregate(state: LegalState) -> dict:
         sections.append(f"## Tax Analysis\n{state['tax_result']}")
     if state.get("compliance_result"):
         sections.append(f"## Regulatory Compliance Analysis\n{state['compliance_result']}")
+    if state.get("privacy_result"):
+        sections.append(f"## Privacy & Data Protection Analysis\n{state['privacy_result']}")
 
     combined = "\n\n---\n\n".join(sections)
 
@@ -278,6 +353,7 @@ def create_graph():
     graph.add_node("check_routing", check_routing)
     graph.add_node("call_tax_specialist", call_tax_specialist)
     graph.add_node("call_compliance_specialist", call_compliance_specialist)
+    graph.add_node("call_privacy_specialist", call_privacy_specialist)
     graph.add_node("aggregate", aggregate)
 
     graph.set_entry_point("analyze_law")
@@ -285,16 +361,28 @@ def create_graph():
     graph.add_conditional_edges(
         "check_routing",
         route_to_specialists,
-        ["call_tax_specialist", "call_compliance_specialist", "aggregate"],
+        ["call_tax_specialist", "call_compliance_specialist", "call_privacy_specialist", "aggregate"],
     )
     graph.add_edge("call_tax_specialist", "aggregate")
     graph.add_edge("call_compliance_specialist", "aggregate")
+    graph.add_edge("call_privacy_specialist", "aggregate")
     graph.add_edge("aggregate", END)
 
     return graph.compile()
 
 
-QUESTION = "If a company breaks a contract and avoids taxes, what are the legal and regulatory consequences?"
+def export_graph_mermaid(graph, output_path: Path | None = None) -> Path:
+    """Export the compiled LangGraph topology to a Mermaid file."""
+    if output_path is None:
+        output_path = Path(__file__).with_name("graph.mmd")
+    output_path.write_text(graph.get_graph().draw_mermaid(), encoding="utf-8")
+    return output_path
+
+
+QUESTION = (
+    "If a company leaks customer data, violates GDPR privacy obligations, breaks a contract, "
+    "and avoids taxes, what are the legal, tax, compliance, and privacy consequences?"
+)
 
 
 async def main():
@@ -305,24 +393,28 @@ async def main():
     print("[How it works]")
     print("  1. Lead attorney agent analyses the question")
     print("  2. Router decides which specialist agents are needed")
-    print("  3. Tax + Compliance specialists run IN PARALLEL (LangGraph Send API)")
+    print("  3. Tax + Compliance + Privacy specialists run IN PARALLEL (LangGraph Send API)")
     print("  4. Aggregator combines all analyses into a final answer")
     print()
     print("[Graph topology]")
-    print("  analyze_law -> check_routing -> [call_tax + call_compliance] -> aggregate -> END")
+    print("  analyze_law -> check_routing -> [call_tax + call_compliance + call_privacy] -> aggregate -> END")
     print()
     print(f"Question: {QUESTION}")
     print("-" * 70)
 
     graph = create_graph()
+    graph_path = export_graph_mermaid(graph)
+    print(f"\n[Graph exported] {graph_path}")
 
     result = await graph.ainvoke({
         "question": QUESTION,
         "law_analysis": "",
         "needs_tax": False,
         "needs_compliance": False,
+        "needs_privacy": False,
         "tax_result": "",
         "compliance_result": "",
+        "privacy_result": "",
         "final_answer": "",
     })
 
@@ -361,3 +453,4 @@ async def main():
 if __name__ == "__main__":
     load_dotenv()
     asyncio.run(main())
+
